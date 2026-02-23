@@ -1,0 +1,10 @@
+services:
+  nginx-mtproto:
+    build: .
+    container_name: nginx-mtproto
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - ./mtproto_dc.conf:/etc/nginx/mtproto_dc.conf:ro
+    stop_signal: SIGQUIT

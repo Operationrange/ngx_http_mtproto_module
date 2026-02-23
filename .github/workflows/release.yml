@@ -1,0 +1,113 @@
+name: Build and Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - distro: debian12
+            container: debian:bookworm
+            codename: bookworm
+          - distro: ubuntu2204
+            container: ubuntu:22.04
+            codename: jammy
+          - distro: ubuntu2404
+            container: ubuntu:24.04
+            codename: noble
+    container: ${{ matrix.container }}
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y build-essential wget libpcre2-dev zlib1g-dev \
+            libssl-dev dpkg-dev gnupg curl ca-certificates lsb-release
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add nginx.org repo and install nginx
+        run: |
+          curl -fsSL https://nginx.org/keys/nginx_signing.key \
+            | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
+            http://nginx.org/packages/mainline/$(. /etc/os-release && echo $ID)/ \
+            ${{ matrix.codename }} nginx" \
+            > /etc/apt/sources.list.d/nginx.list
+          apt-get update
+          apt-get install -y nginx
+
+      - name: Get nginx version and download source
+        id: nginx
+        run: |
+          NGINX_VERSION=$(nginx -v 2>&1 | grep -oP '[\d.]+')
+          echo "version=${NGINX_VERSION}" >> "$GITHUB_OUTPUT"
+          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+          tar xzf "nginx-${NGINX_VERSION}.tar.gz"
+
+      - name: Build dynamic module
+        run: |
+          cd "nginx-${{ steps.nginx.outputs.version }}"
+          ./configure \
+            --with-compat \
+            --with-http_ssl_module \
+            --add-dynamic-module="$GITHUB_WORKSPACE"
+          make modules
+
+      - name: Build deb package
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          NGINX_VERSION="${{ steps.nginx.outputs.version }}"
+          CODENAME="${{ matrix.codename }}"
+          PKG_NAME="libnginx-mod-http-mtproto_${TAG_VERSION}-1~${CODENAME}_amd64"
+
+          mkdir -p "${PKG_NAME}/DEBIAN"
+          mkdir -p "${PKG_NAME}/usr/lib/nginx/modules"
+
+          cp "nginx-${NGINX_VERSION}/objs/ngx_http_mtproto_module.so" \
+            "${PKG_NAME}/usr/lib/nginx/modules/"
+
+          cat > "${PKG_NAME}/DEBIAN/control" <<EOF
+          Package: libnginx-mod-http-mtproto
+          Version: ${TAG_VERSION}-1~${CODENAME}
+          Architecture: amd64
+          Depends: nginx (>= ${NGINX_VERSION})
+          Section: httpd
+          Priority: optional
+          Maintainer: Operationrange
+          Description: Nginx dynamic module — MTProto proxy (Telegram)
+           Embeds MTProto proxy into nginx. Detects Telegram clients via
+           HMAC on TLS ClientHello, non-matching traffic served normally.
+          EOF
+
+          dpkg-deb --build "${PKG_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.distro }}
+          path: '*.deb'
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: '*.deb'
