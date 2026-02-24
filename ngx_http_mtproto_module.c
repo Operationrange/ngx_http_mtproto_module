@@ -47,8 +47,8 @@ static void ngx_http_mtproto_dc_write_handler(ngx_event_t *wev);
 static void ngx_http_mtproto_client_write_handler(ngx_event_t *wev);
 static void ngx_http_mtproto_close(ngx_http_mtproto_ctx_t *ctx);
 static void ngx_http_mtproto_cleanup(void *data);
-static ngx_int_t ngx_http_mtproto_send_all(ngx_connection_t *c,
-    u_char *data, size_t len);
+static ngx_int_t ngx_http_mtproto_flush_buf(ngx_connection_t *c, u_char *buf,
+    size_t *pos, size_t *len);
 
 /* ── Constants ────────────────────────────────────────────────────────── */
 
@@ -57,6 +57,10 @@ static ngx_int_t ngx_http_mtproto_send_all(ngx_connection_t *c,
 #define MTPROTO_TLS_HEADER_LEN  5
 #define MTPROTO_TLS_MAX_PAYLOAD 16384
 #define MTPROTO_OBFS2_HEADER    64
+
+/* dbuf must hold MTPROTO_RELAY_BUF of encrypted data + TLS framing overhead:
+ * ceil(32768/16384) * 5 = 10 bytes.  Round up generously. */
+#define MTPROTO_DBUF_SIZE       (MTPROTO_RELAY_BUF + 256)
 
 /* connection states */
 #define MTPROTO_STATE_PREREAD        0
@@ -711,7 +715,7 @@ ngx_http_mtproto_preread(ngx_event_t *rev)
     if (ngx_http_mtproto_verify_hmac(ctx, ctx->preread_data, total_needed)
         == NGX_OK)
     {
-        ngx_log_error(NGX_LOG_NOTICE, c->log, 0,
+        ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                       "mtproto: HMAC verified — MTProto client detected");
 
         /*
@@ -1025,7 +1029,7 @@ ngx_http_mtproto_send_server_hello(ngx_http_mtproto_ctx_t *ctx)
         return NGX_ERROR;
     }
 
-    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+    ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                   "mtproto: sent ServerHello (%uz bytes)", pos);
 
     ctx->state = MTPROTO_STATE_HELLO_SENT;
@@ -1184,7 +1188,7 @@ ngx_http_mtproto_client_read_obfs_header(ngx_event_t *rev)
         ctx->cbuf_pos = 0;
     }
 
-    ngx_log_error(NGX_LOG_NOTICE, c->log, 0,
+    ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                   "mtproto: obfs2 parsed, DC=%d, connecting...", ctx->dc_id);
 
     /* Connect to DC */
@@ -1299,7 +1303,7 @@ ngx_http_mtproto_parse_obfs_header(ngx_http_mtproto_ctx_t *ctx,
 
     ctx->dc_id = dc_id;
 
-    ngx_log_error(NGX_LOG_INFO, ctx->client_conn->log, 0,
+    ngx_log_error(NGX_LOG_DEBUG, ctx->client_conn->log, 0,
                   "mtproto: obfs2 header parsed, proto=0x%08xd dc=%d",
                   proto_tag, dc_id);
 
@@ -1403,7 +1407,7 @@ ngx_http_mtproto_dc_connect_handler(ngx_event_t *wev)
         return;
     }
 
-    ngx_log_error(NGX_LOG_INFO, dc->log, 0,
+    ngx_log_error(NGX_LOG_DEBUG, dc->log, 0,
                   "mtproto: connected to DC %d", ctx->dc_id);
 
     /*
@@ -1423,7 +1427,7 @@ ngx_http_mtproto_dc_connect_handler(ngx_event_t *wev)
             ngx_http_mtproto_close(ctx);
             return;
         }
-        ngx_log_error(NGX_LOG_NOTICE, dc->log, 0,
+        ngx_log_error(NGX_LOG_DEBUG, dc->log, 0,
                       "mtproto: DC %d using protocol tag 0x%08xd",
                       ctx->dc_id, ctx->proto_tag);
     }
@@ -1440,32 +1444,13 @@ ngx_http_mtproto_dc_connect_handler(ngx_event_t *wev)
     }
 
     if (ctx->dbuf == NULL) {
-        ctx->dbuf = ngx_pnalloc(ctx->pool, MTPROTO_RELAY_BUF);
+        ctx->dbuf = ngx_pnalloc(ctx->pool, MTPROTO_DBUF_SIZE);
         if (ctx->dbuf == NULL) {
             ngx_http_mtproto_close(ctx);
             return;
         }
         ctx->dbuf_len = 0;
         ctx->dbuf_pos = 0;
-    }
-
-    /* If we have buffered data from the client (extra from obfs header TLS record),
-     * send it to DC as plaintext (already decrypted with c_dec) */
-    if (ctx->cbuf_len > 0) {
-        ngx_log_error(NGX_LOG_INFO, dc->log, 0,
-                      "mtproto: forwarding %uz bytes to DC",
-                      ctx->cbuf_len);
-
-        if (ngx_http_mtproto_send_all(dc, ctx->cbuf, ctx->cbuf_len)
-            != NGX_OK)
-        {
-            ngx_log_error(NGX_LOG_ERR, dc->log, 0,
-                          "mtproto: failed to send buffered data to DC");
-            ngx_http_mtproto_close(ctx);
-            return;
-        }
-        ctx->cbuf_len = 0;
-        ctx->cbuf_pos = 0;
     }
 
     /* Enter relay mode */
@@ -1476,6 +1461,43 @@ ngx_http_mtproto_dc_connect_handler(ngx_event_t *wev)
     ctx->client_conn->write->handler = ngx_http_mtproto_client_write_handler;
     ctx->dc_conn->read->handler = ngx_http_mtproto_dc_read_handler;
     ctx->dc_conn->write->handler = ngx_http_mtproto_dc_write_handler;
+
+    /* If we have buffered data from the client (extra from obfs header TLS record),
+     * try to flush it to DC now (already decrypted with c_dec) */
+    if (ctx->cbuf_len > 0) {
+        ngx_int_t rc;
+
+        ngx_log_error(NGX_LOG_DEBUG, dc->log, 0,
+                      "mtproto: forwarding %uz bytes to DC",
+                      ctx->cbuf_len);
+
+        rc = ngx_http_mtproto_flush_buf(dc, ctx->cbuf,
+                                         &ctx->cbuf_pos, &ctx->cbuf_len);
+        if (rc == NGX_ERROR) {
+            ngx_log_error(NGX_LOG_ERR, dc->log, 0,
+                          "mtproto: failed to send buffered data to DC");
+            ngx_http_mtproto_close(ctx);
+            return;
+        }
+
+        if (rc == NGX_AGAIN) {
+            /* DC write buffer full — arm write event, skip client reads
+             * until dc_write_handler flushes the buffer */
+            if (ngx_handle_write_event(ctx->dc_conn->write, 0) != NGX_OK) {
+                ngx_http_mtproto_close(ctx);
+                return;
+            }
+            if (ngx_handle_read_event(ctx->dc_conn->read, 0) != NGX_OK) {
+                ngx_http_mtproto_close(ctx);
+                return;
+            }
+            ngx_add_timer(ctx->dc_conn->read, ctx->conf->timeout);
+
+            ngx_log_error(NGX_LOG_DEBUG, ctx->client_conn->log, 0,
+                          "mtproto: relay mode active, DC=%d", ctx->dc_id);
+            return;
+        }
+    }
 
     /* Add timeouts */
     ngx_add_timer(ctx->client_conn->read, ctx->conf->timeout);
@@ -1491,33 +1513,35 @@ ngx_http_mtproto_dc_connect_handler(ngx_event_t *wev)
         return;
     }
 
-    ngx_log_error(NGX_LOG_NOTICE, ctx->client_conn->log, 0,
+    ngx_log_error(NGX_LOG_DEBUG, ctx->client_conn->log, 0,
                   "mtproto: relay mode active, DC=%d", ctx->dc_id);
 }
 
-/* ── Helper: send all bytes, handling partial sends ───────────────────── */
+/* ── Helper: flush send buffer, non-blocking ──────────────────────────── */
 
 static ngx_int_t
-ngx_http_mtproto_send_all(ngx_connection_t *c, u_char *data, size_t len)
+ngx_http_mtproto_flush_buf(ngx_connection_t *c, u_char *buf,
+    size_t *pos, size_t *len)
 {
-    ssize_t  sent;
-    size_t   remaining = len;
+    ssize_t  n;
 
-    while (remaining > 0) {
-        sent = c->send(c, data + (len - remaining), remaining);
+    while (*pos < *len) {
+        n = c->send(c, buf + *pos, *len - *pos);
 
-        if (sent == NGX_ERROR) {
+        if (n == NGX_ERROR) {
             return NGX_ERROR;
         }
 
-        if (sent == NGX_AGAIN) {
-            /* Would block — try again after event */
-            ngx_msleep(1);
-            continue;
+        if (n == NGX_AGAIN) {
+            return NGX_AGAIN;
         }
 
-        remaining -= sent;
+        *pos += n;
     }
+
+    /* All sent, reset buffer */
+    *pos = 0;
+    *len = 0;
 
     return NGX_OK;
 }
@@ -1530,6 +1554,7 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
     ngx_connection_t          *c;
     ngx_http_mtproto_ctx_t    *ctx;
     ssize_t                    n;
+    ngx_int_t                  rc;
     u_char                     raw[MTPROTO_RELAY_BUF];
     u_char                     decrypted[MTPROTO_RELAY_BUF];
     int                        outl;
@@ -1546,6 +1571,25 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
                       "mtproto: client read timeout");
         ngx_http_mtproto_close(ctx);
         return;
+    }
+
+    /* If cbuf still has unsent data, try to flush first */
+    if (ctx->cbuf_len > ctx->cbuf_pos) {
+        rc = ngx_http_mtproto_flush_buf(ctx->dc_conn, ctx->cbuf,
+                                         &ctx->cbuf_pos, &ctx->cbuf_len);
+        if (rc == NGX_ERROR) {
+            ngx_http_mtproto_close(ctx);
+            return;
+        }
+
+        if (rc == NGX_AGAIN) {
+            /* Still blocked — keep write event armed, deactivate read */
+            if (ngx_handle_write_event(ctx->dc_conn->write, 0) != NGX_OK) {
+                ngx_http_mtproto_close(ctx);
+            }
+            ngx_handle_read_event(rev, 0);
+            return;
+        }
     }
 
     /* Reset timeout */
@@ -1568,16 +1612,19 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
             return;
         }
 
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                       "mtproto: client sent %z bytes", n);
 
         /*
          * Process TLS record framing from client:
          * Each record: [type, 0x03, 0x03, len_hi, len_lo, payload...]
-         * We strip headers and relay payloads (re-encrypting).
+         * We strip headers and decrypt payloads into cbuf.
          * CCS records (0x14) are silently skipped.
          */
         size_t pos = 0;
+
+        ctx->cbuf_pos = 0;
+        ctx->cbuf_len = 0;
 
         while (pos < (size_t) n) {
             /* If we're in the middle of reading a TLS payload */
@@ -1596,21 +1643,12 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
                     continue;
                 }
 
-                /* Decrypt client data (obfs2) */
+                /* Decrypt client data into cbuf */
                 EVP_EncryptUpdate(ctx->c_dec, decrypted, &outl,
                                   raw + pos, chunk);
-
-                /* Send plaintext to DC (no DC-side crypto) */
-                if (ctx->dc_conn) {
-                    if (ngx_http_mtproto_send_all(ctx->dc_conn,
-                                                   decrypted, outl)
-                        != NGX_OK)
-                    {
-                        ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                                      "mtproto: failed to send to DC");
-                        ngx_http_mtproto_close(ctx);
-                        return;
-                    }
+                if (outl > 0) {
+                    ngx_memcpy(ctx->cbuf + ctx->cbuf_len, decrypted, outl);
+                    ctx->cbuf_len += outl;
                 }
 
                 pos += chunk;
@@ -1647,6 +1685,29 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
                 continue;
             }
         }
+
+        /* Flush accumulated decrypted data to DC */
+        if (ctx->cbuf_len > 0 && ctx->dc_conn) {
+            rc = ngx_http_mtproto_flush_buf(ctx->dc_conn, ctx->cbuf,
+                                             &ctx->cbuf_pos, &ctx->cbuf_len);
+            if (rc == NGX_ERROR) {
+                ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                              "mtproto: failed to send to DC");
+                ngx_http_mtproto_close(ctx);
+                return;
+            }
+
+            if (rc == NGX_AGAIN) {
+                /* Backpressure: stop reading from client, arm DC write */
+                if (ngx_handle_write_event(ctx->dc_conn->write, 0)
+                    != NGX_OK)
+                {
+                    ngx_http_mtproto_close(ctx);
+                    return;
+                }
+                break;
+            }
+        }
     }
 
     if (ngx_handle_read_event(rev, 0) != NGX_OK) {
@@ -1662,9 +1723,9 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
     ngx_connection_t          *dc;
     ngx_http_mtproto_ctx_t    *ctx;
     ssize_t                    n;
+    ngx_int_t                  rc;
     u_char                     raw[MTPROTO_RELAY_BUF];
     u_char                     encrypted[MTPROTO_RELAY_BUF];
-    u_char                     tls_frame[MTPROTO_RELAY_BUF + MTPROTO_TLS_HEADER_LEN];
     int                        outl;
 
     dc = rev->data;
@@ -1679,6 +1740,25 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
                       "mtproto: DC read timeout");
         ngx_http_mtproto_close(ctx);
         return;
+    }
+
+    /* If dbuf still has unsent data, try to flush first */
+    if (ctx->dbuf_len > ctx->dbuf_pos) {
+        rc = ngx_http_mtproto_flush_buf(ctx->client_conn, ctx->dbuf,
+                                         &ctx->dbuf_pos, &ctx->dbuf_len);
+        if (rc == NGX_ERROR) {
+            ngx_http_mtproto_close(ctx);
+            return;
+        }
+
+        if (rc == NGX_AGAIN) {
+            /* Still blocked — keep write event armed, deactivate read */
+            if (ngx_handle_write_event(ctx->client_conn->write, 0) != NGX_OK) {
+                ngx_http_mtproto_close(ctx);
+            }
+            ngx_handle_read_event(rev, 0);
+            return;
+        }
     }
 
     /* Reset timeout */
@@ -1701,45 +1781,58 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
             return;
         }
 
-        ngx_log_error(NGX_LOG_INFO, dc->log, 0,
+        ngx_log_error(NGX_LOG_DEBUG, dc->log, 0,
                       "mtproto: DC sent %z bytes", n);
 
         /* DC data is plaintext — encrypt for client (obfs2) */
         EVP_EncryptUpdate(ctx->c_enc, encrypted, &outl, raw, n);
 
         /*
-         * Wrap in TLS Application Data records and send to client.
+         * Wrap in TLS Application Data records into dbuf.
          * Split into chunks of max 16384 bytes.
          */
         size_t pos = 0;
         size_t total = outl;
 
+        ctx->dbuf_pos = 0;
+        ctx->dbuf_len = 0;
+
         while (pos < total) {
             size_t chunk = ngx_min(total - pos,
                                    (size_t) MTPROTO_TLS_MAX_PAYLOAD);
 
-            tls_frame[0] = 0x17;
-            tls_frame[1] = 0x03;
-            tls_frame[2] = 0x03;
-            tls_frame[3] = (chunk >> 8) & 0xff;
-            tls_frame[4] = chunk & 0xff;
-            ngx_memcpy(tls_frame + MTPROTO_TLS_HEADER_LEN,
-                       encrypted + pos, chunk);
+            ctx->dbuf[ctx->dbuf_len++] = 0x17;
+            ctx->dbuf[ctx->dbuf_len++] = 0x03;
+            ctx->dbuf[ctx->dbuf_len++] = 0x03;
+            ctx->dbuf[ctx->dbuf_len++] = (chunk >> 8) & 0xff;
+            ctx->dbuf[ctx->dbuf_len++] = chunk & 0xff;
+            ngx_memcpy(ctx->dbuf + ctx->dbuf_len, encrypted + pos, chunk);
+            ctx->dbuf_len += chunk;
 
-            if (ctx->client_conn) {
-                if (ngx_http_mtproto_send_all(ctx->client_conn,
-                                               tls_frame,
-                                               MTPROTO_TLS_HEADER_LEN + chunk)
+            pos += chunk;
+        }
+
+        /* Flush framed data to client */
+        if (ctx->dbuf_len > 0 && ctx->client_conn) {
+            rc = ngx_http_mtproto_flush_buf(ctx->client_conn, ctx->dbuf,
+                                             &ctx->dbuf_pos, &ctx->dbuf_len);
+            if (rc == NGX_ERROR) {
+                ngx_log_error(NGX_LOG_ERR, dc->log, 0,
+                              "mtproto: failed to send to client");
+                ngx_http_mtproto_close(ctx);
+                return;
+            }
+
+            if (rc == NGX_AGAIN) {
+                /* Backpressure: stop reading from DC, arm client write */
+                if (ngx_handle_write_event(ctx->client_conn->write, 0)
                     != NGX_OK)
                 {
-                    ngx_log_error(NGX_LOG_ERR, dc->log, 0,
-                                  "mtproto: failed to send to client");
                     ngx_http_mtproto_close(ctx);
                     return;
                 }
+                break;
             }
-
-            pos += chunk;
         }
     }
 
@@ -1748,18 +1841,19 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
     }
 }
 
-/* ── Write handlers (for when the other side is busy) ─────────────────── */
+/* ── Write handlers: flush pending buffers and resume reads ────────────── */
 
 static void
 ngx_http_mtproto_client_write_handler(ngx_event_t *wev)
 {
     ngx_connection_t          *c;
     ngx_http_mtproto_ctx_t    *ctx;
+    ngx_int_t                  rc;
 
     c = wev->data;
     ctx = c->data;
 
-    if (ctx == NULL) {
+    if (ctx == NULL || ctx->state != MTPROTO_STATE_RELAY) {
         return;
     }
 
@@ -1770,9 +1864,32 @@ ngx_http_mtproto_client_write_handler(ngx_event_t *wev)
         return;
     }
 
-    /* Try to flush any pending data */
+    /* Flush dbuf (DC → client direction) */
+    if (ctx->dbuf_len > ctx->dbuf_pos) {
+        rc = ngx_http_mtproto_flush_buf(c, ctx->dbuf,
+                                         &ctx->dbuf_pos, &ctx->dbuf_len);
+        if (rc == NGX_ERROR) {
+            ngx_http_mtproto_close(ctx);
+            return;
+        }
+
+        if (rc == NGX_AGAIN) {
+            /* Still blocked, re-arm write event */
+            if (ngx_handle_write_event(wev, 0) != NGX_OK) {
+                ngx_http_mtproto_close(ctx);
+            }
+            return;
+        }
+    }
+
     if (ngx_handle_write_event(wev, 0) != NGX_OK) {
         ngx_http_mtproto_close(ctx);
+        return;
+    }
+
+    /* Buffer flushed — resume reading from DC */
+    if (ctx->dc_conn) {
+        ngx_post_event(ctx->dc_conn->read, &ngx_posted_events);
     }
 }
 
@@ -1781,11 +1898,12 @@ ngx_http_mtproto_dc_write_handler(ngx_event_t *wev)
 {
     ngx_connection_t          *dc;
     ngx_http_mtproto_ctx_t    *ctx;
+    ngx_int_t                  rc;
 
     dc = wev->data;
     ctx = dc->data;
 
-    if (ctx == NULL) {
+    if (ctx == NULL || ctx->state != MTPROTO_STATE_RELAY) {
         return;
     }
 
@@ -1796,8 +1914,32 @@ ngx_http_mtproto_dc_write_handler(ngx_event_t *wev)
         return;
     }
 
+    /* Flush cbuf (client → DC direction) */
+    if (ctx->cbuf_len > ctx->cbuf_pos) {
+        rc = ngx_http_mtproto_flush_buf(dc, ctx->cbuf,
+                                         &ctx->cbuf_pos, &ctx->cbuf_len);
+        if (rc == NGX_ERROR) {
+            ngx_http_mtproto_close(ctx);
+            return;
+        }
+
+        if (rc == NGX_AGAIN) {
+            /* Still blocked, re-arm write event */
+            if (ngx_handle_write_event(wev, 0) != NGX_OK) {
+                ngx_http_mtproto_close(ctx);
+            }
+            return;
+        }
+    }
+
     if (ngx_handle_write_event(wev, 0) != NGX_OK) {
         ngx_http_mtproto_close(ctx);
+        return;
+    }
+
+    /* Buffer flushed — resume reading from client */
+    if (ctx->client_conn) {
+        ngx_post_event(ctx->client_conn->read, &ngx_posted_events);
     }
 }
 
@@ -1812,7 +1954,7 @@ ngx_http_mtproto_close(ngx_http_mtproto_ctx_t *ctx)
 
     ctx->state = MTPROTO_STATE_DONE;
 
-    ngx_log_error(NGX_LOG_INFO,
+    ngx_log_error(NGX_LOG_DEBUG,
                   ctx->client_conn ? ctx->client_conn->log : ngx_cycle->log,
                   0, "mtproto: closing connection");
 
