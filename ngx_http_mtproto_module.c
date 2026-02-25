@@ -1532,7 +1532,7 @@ ngx_http_mtproto_flush_buf(ngx_connection_t *c, u_char *buf,
             return NGX_ERROR;
         }
 
-        if (n == NGX_AGAIN) {
+        if (n == NGX_AGAIN || n == 0) {
             return NGX_AGAIN;
         }
 
@@ -1880,17 +1880,25 @@ ngx_http_mtproto_client_write_handler(ngx_event_t *wev)
             }
             return;
         }
+
+        /* Buffer flushed — resume reading from DC */
+        if (ctx->dc_conn) {
+            ngx_post_event(ctx->dc_conn->read, &ngx_posted_events);
+        }
     }
 
+    /*
+     * No pending data — deactivate write event to prevent busy-looping.
+     * On level-triggered (poll/select): active+ready causes deletion.
+     * On edge-triggered (epoll/kqueue): harmless no-op (edge consumed).
+     * Clear wev->ready so the read handler can re-arm via
+     * ngx_handle_write_event() when backpressure occurs.
+     */
     if (ngx_handle_write_event(wev, 0) != NGX_OK) {
         ngx_http_mtproto_close(ctx);
         return;
     }
-
-    /* Buffer flushed — resume reading from DC */
-    if (ctx->dc_conn) {
-        ngx_post_event(ctx->dc_conn->read, &ngx_posted_events);
-    }
+    wev->ready = 0;
 }
 
 static void
@@ -1930,17 +1938,25 @@ ngx_http_mtproto_dc_write_handler(ngx_event_t *wev)
             }
             return;
         }
+
+        /* Buffer flushed — resume reading from client */
+        if (ctx->client_conn) {
+            ngx_post_event(ctx->client_conn->read, &ngx_posted_events);
+        }
     }
 
+    /*
+     * No pending data — deactivate write event to prevent busy-looping.
+     * On level-triggered (poll/select): active+ready causes deletion.
+     * On edge-triggered (epoll/kqueue): harmless no-op (edge consumed).
+     * Clear wev->ready so the read handler can re-arm via
+     * ngx_handle_write_event() when backpressure occurs.
+     */
     if (ngx_handle_write_event(wev, 0) != NGX_OK) {
         ngx_http_mtproto_close(ctx);
         return;
     }
-
-    /* Buffer flushed — resume reading from client */
-    if (ctx->client_conn) {
-        ngx_post_event(ctx->client_conn->read, &ngx_posted_events);
-    }
+    wev->ready = 0;
 }
 
 /* ── Cleanup & close ──────────────────────────────────────────────────── */
