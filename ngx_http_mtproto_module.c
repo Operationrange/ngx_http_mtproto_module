@@ -13,6 +13,7 @@
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/crypto.h>
 #include <sys/socket.h>
 
 /* ── Forward declarations ─────────────────────────────────────────────── */
@@ -57,6 +58,7 @@ static ngx_int_t ngx_http_mtproto_flush_buf(ngx_connection_t *c, u_char *buf,
 #define MTPROTO_TLS_HEADER_LEN  5
 #define MTPROTO_TLS_MAX_PAYLOAD 16384
 #define MTPROTO_OBFS2_HEADER    64
+#define MTPROTO_MAX_CCS_RECORDS 16
 
 /* dbuf must hold MTPROTO_RELAY_BUF of encrypted data + TLS framing overhead:
  * ceil(32768/16384) * 5 = 10 bytes.  Round up generously. */
@@ -114,8 +116,6 @@ struct ngx_http_mtproto_ctx_s {
     /* AES-CTR crypto contexts */
     EVP_CIPHER_CTX               *c_dec;          /* decrypt from client */
     EVP_CIPHER_CTX               *c_enc;          /* encrypt to client */
-    EVP_CIPHER_CTX               *d_dec;          /* decrypt from DC */
-    EVP_CIPHER_CTX               *d_enc;          /* encrypt to DC */
 
     /* from ClientHello */
     u_char                        session_id[32];
@@ -794,10 +794,13 @@ ngx_http_mtproto_verify_hmac(ngx_http_mtproto_ctx_t *ctx, u_char *data,
     /* Extract session_id */
     ngx_uint_t sid_len = data[43];
     if (sid_len > 32) {
-        sid_len = 32;
+        return NGX_ERROR;
+    }
+    if (len < 44 + sid_len) {
+        return NGX_ERROR;
     }
     ctx->session_id_len = sid_len;
-    if (sid_len > 0 && len >= 44 + sid_len) {
+    if (sid_len > 0) {
         ngx_memcpy(ctx->session_id, &data[44], sid_len);
     }
 
@@ -822,7 +825,7 @@ ngx_http_mtproto_verify_hmac(ngx_http_mtproto_ctx_t *ctx, u_char *data,
      * of the random field.  Compare only the first 28 bytes, then extract
      * the timestamp and check it's within a reasonable window.
      */
-    if (ngx_memcmp(expected, data + 11, 28) != 0) {
+    if (CRYPTO_memcmp(expected, data + 11, 28) != 0) {
         return NGX_ERROR;
     }
 
@@ -981,7 +984,9 @@ ngx_http_mtproto_send_server_hello(ngx_http_mtproto_ctx_t *ctx)
 
     /* ── 3. Fake Application Data ──────────────────────────────────── */
 
-    size_t fake_len = 1200 + (ngx_random() % 201);
+    u_char rand_byte;
+    RAND_bytes(&rand_byte, 1);
+    size_t fake_len = 1200 + (rand_byte % 201);
     u_char *fake_data = ngx_pnalloc(ctx->pool, fake_len);
     if (fake_data == NULL) {
         return NGX_ERROR;
@@ -1087,12 +1092,34 @@ ngx_http_mtproto_client_read_obfs_header(ngx_event_t *rev)
      * Skip any CCS records before the AppData.
      */
     size_t skip = 0;
+    ngx_uint_t ccs_count = 0;
     while (skip + MTPROTO_TLS_HEADER_LEN <= ctx->preread_len
            && ctx->preread_data[skip] == 0x14)
     {
         size_t ccs_len = (ctx->preread_data[skip + 3] << 8)
                          | ctx->preread_data[skip + 4];
+
+        /* CCS payload must be exactly 1 byte per TLS RFC */
+        if (ccs_len != 1) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "mtproto: invalid CCS payload length: %uz", ccs_len);
+            ngx_http_mtproto_close(ctx);
+            return;
+        }
+
+        /* Bounds check before advancing */
+        if (skip + MTPROTO_TLS_HEADER_LEN + ccs_len > ctx->preread_len) {
+            break;
+        }
+
         skip += MTPROTO_TLS_HEADER_LEN + ccs_len;
+
+        if (++ccs_count > MTPROTO_MAX_CCS_RECORDS) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "mtproto: too many CCS records (%ui)", ccs_count);
+            ngx_http_mtproto_close(ctx);
+            return;
+        }
     }
 
     if (skip > 0 && skip <= ctx->preread_len) {
@@ -1168,8 +1195,14 @@ ngx_http_mtproto_client_read_obfs_header(ngx_event_t *rev)
 
         /* Decrypt the extra data with client decrypt key */
         int outl;
-        EVP_EncryptUpdate(ctx->c_dec, ctx->cbuf, &outl,
-                          obfs_data + MTPROTO_OBFS2_HEADER, extra);
+        if (EVP_EncryptUpdate(ctx->c_dec, ctx->cbuf, &outl,
+                              obfs_data + MTPROTO_OBFS2_HEADER, extra) != 1)
+        {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "mtproto: EVP_EncryptUpdate (extra data) failed");
+            ngx_http_mtproto_close(ctx);
+            return;
+        }
         ctx->cbuf_len = outl;
         ctx->cbuf_pos = 0;
     }
@@ -1212,7 +1245,9 @@ ngx_http_mtproto_parse_obfs_header(ngx_http_mtproto_ctx_t *ctx,
     int16_t         dc_id;
     uint32_t        proto_tag;
     u_char          reversed[48];
+    u_char          decrypted[8];
     ngx_uint_t      i;
+    ngx_int_t       rc;
 
     if (len < MTPROTO_OBFS2_HEADER) {
         return NGX_ERROR;
@@ -1249,26 +1284,43 @@ ngx_http_mtproto_parse_obfs_header(ngx_http_mtproto_ctx_t *ctx,
      */
     ctx->c_dec = EVP_CIPHER_CTX_new();
     if (ctx->c_dec == NULL) {
-        return NGX_ERROR;
+        rc = NGX_ERROR;
+        goto cleanup;
     }
-    EVP_EncryptInit_ex(ctx->c_dec, EVP_aes_256_ctr(), NULL, enc_key, enc_iv);
+    if (EVP_EncryptInit_ex(ctx->c_dec, EVP_aes_256_ctr(), NULL,
+                           enc_key, enc_iv) != 1)
+    {
+        rc = NGX_ERROR;
+        goto cleanup;
+    }
 
     /*
      * Setup AES-256-CTR for proxy→client (encrypt outgoing)
      */
     ctx->c_enc = EVP_CIPHER_CTX_new();
     if (ctx->c_enc == NULL) {
-        return NGX_ERROR;
+        rc = NGX_ERROR;
+        goto cleanup;
     }
-    EVP_EncryptInit_ex(ctx->c_enc, EVP_aes_256_ctr(), NULL, dec_key, dec_iv);
+    if (EVP_EncryptInit_ex(ctx->c_enc, EVP_aes_256_ctr(), NULL,
+                           dec_key, dec_iv) != 1)
+    {
+        rc = NGX_ERROR;
+        goto cleanup;
+    }
 
     /*
      * Skip first 56 bytes of client→proxy keystream, then decrypt nonce[56..63]
      */
-    EVP_EncryptUpdate(ctx->c_dec, skip_buf, &outl, nonce, 56);
+    if (EVP_EncryptUpdate(ctx->c_dec, skip_buf, &outl, nonce, 56) != 1) {
+        rc = NGX_ERROR;
+        goto cleanup;
+    }
 
-    u_char decrypted[8];
-    EVP_EncryptUpdate(ctx->c_dec, decrypted, &outl, nonce + 56, 8);
+    if (EVP_EncryptUpdate(ctx->c_dec, decrypted, &outl, nonce + 56, 8) != 1) {
+        rc = NGX_ERROR;
+        goto cleanup;
+    }
 
     /* Extract protocol tag (bytes 0..3) and dc_id (bytes 4..5) */
     ngx_memcpy(&proto_tag, decrypted, 4);
@@ -1283,7 +1335,8 @@ ngx_http_mtproto_parse_obfs_header(ngx_http_mtproto_ctx_t *ctx,
     {
         ngx_log_error(NGX_LOG_ERR, ctx->client_conn->log, 0,
                       "mtproto: unexpected protocol tag: 0x%08xd", proto_tag);
-        return NGX_ERROR;
+        rc = NGX_ERROR;
+        goto cleanup;
     }
 
     ctx->proto_tag = proto_tag;
@@ -1292,13 +1345,14 @@ ngx_http_mtproto_parse_obfs_header(ngx_http_mtproto_ctx_t *ctx,
     /* dc_id is little-endian int16 */
     if (dc_id < 0) {
         /* negative = test DC, take absolute value */
-        dc_id = -dc_id;
+        dc_id = (int16_t)(-(int32_t)dc_id);
     }
 
     if (dc_id < 1 || dc_id > 10) {
         ngx_log_error(NGX_LOG_ERR, ctx->client_conn->log, 0,
                       "mtproto: invalid DC id: %d", dc_id);
-        return NGX_ERROR;
+        rc = NGX_ERROR;
+        goto cleanup;
     }
 
     ctx->dc_id = dc_id;
@@ -1307,7 +1361,21 @@ ngx_http_mtproto_parse_obfs_header(ngx_http_mtproto_ctx_t *ctx,
                   "mtproto: obfs2 header parsed, proto=0x%08xd dc=%d",
                   proto_tag, dc_id);
 
-    return NGX_OK;
+    rc = NGX_OK;
+
+cleanup:
+    OPENSSL_cleanse(nonce, sizeof(nonce));
+    OPENSSL_cleanse(enc_key_data, sizeof(enc_key_data));
+    OPENSSL_cleanse(dec_key_data, sizeof(dec_key_data));
+    OPENSSL_cleanse(enc_key, sizeof(enc_key));
+    OPENSSL_cleanse(dec_key, sizeof(dec_key));
+    OPENSSL_cleanse(enc_iv, sizeof(enc_iv));
+    OPENSSL_cleanse(dec_iv, sizeof(dec_iv));
+    OPENSSL_cleanse(reversed, sizeof(reversed));
+    OPENSSL_cleanse(skip_buf, sizeof(skip_buf));
+    OPENSSL_cleanse(decrypted, sizeof(decrypted));
+
+    return rc;
 }
 
 /* ── DC connection ────────────────────────────────────────────────────── */
@@ -1383,6 +1451,10 @@ ngx_http_mtproto_dc_connect_handler(ngx_event_t *wev)
 
     dc = wev->data;
     ctx = dc->data;
+
+    if (ctx == NULL || ctx->state == MTPROTO_STATE_DONE) {
+        return;
+    }
 
     if (wev->timedout) {
         ngx_log_error(NGX_LOG_ERR, dc->log, 0,
@@ -1575,6 +1647,10 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
 
     /* If cbuf still has unsent data, try to flush first */
     if (ctx->cbuf_len > ctx->cbuf_pos) {
+        if (ctx->dc_conn == NULL) {
+            ngx_http_mtproto_close(ctx);
+            return;
+        }
         rc = ngx_http_mtproto_flush_buf(ctx->dc_conn, ctx->cbuf,
                                          &ctx->cbuf_pos, &ctx->cbuf_len);
         if (rc == NGX_ERROR) {
@@ -1644,9 +1720,21 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
                 }
 
                 /* Decrypt client data into cbuf */
-                EVP_EncryptUpdate(ctx->c_dec, decrypted, &outl,
-                                  raw + pos, chunk);
+                if (EVP_EncryptUpdate(ctx->c_dec, decrypted, &outl,
+                                      raw + pos, chunk) != 1)
+                {
+                    ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                                  "mtproto: EVP_EncryptUpdate (c_dec) failed");
+                    ngx_http_mtproto_close(ctx);
+                    return;
+                }
                 if (outl > 0) {
+                    if (ctx->cbuf_len + (size_t) outl > MTPROTO_RELAY_BUF) {
+                        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                                      "mtproto: cbuf overflow");
+                        ngx_http_mtproto_close(ctx);
+                        return;
+                    }
                     ngx_memcpy(ctx->cbuf + ctx->cbuf_len, decrypted, outl);
                     ctx->cbuf_len += outl;
                 }
@@ -1680,6 +1768,18 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
 
                     ctx->tls_payload_remain =
                         (ctx->tls_hdr[3] << 8) | ctx->tls_hdr[4];
+
+                    /* TLS max record payload is 16384 + 256 (encrypted overhead) */
+                    if (ctx->tls_payload_remain
+                        > MTPROTO_TLS_MAX_PAYLOAD + 256)
+                    {
+                        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                                      "mtproto: TLS payload too large: %uz",
+                                      ctx->tls_payload_remain);
+                        ngx_http_mtproto_close(ctx);
+                        return;
+                    }
+
                     ctx->tls_in_payload = 1;
                 }
                 continue;
@@ -1744,6 +1844,10 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
 
     /* If dbuf still has unsent data, try to flush first */
     if (ctx->dbuf_len > ctx->dbuf_pos) {
+        if (ctx->client_conn == NULL) {
+            ngx_http_mtproto_close(ctx);
+            return;
+        }
         rc = ngx_http_mtproto_flush_buf(ctx->client_conn, ctx->dbuf,
                                          &ctx->dbuf_pos, &ctx->dbuf_len);
         if (rc == NGX_ERROR) {
@@ -1785,7 +1889,12 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
                       "mtproto: DC sent %z bytes", n);
 
         /* DC data is plaintext — encrypt for client (obfs2) */
-        EVP_EncryptUpdate(ctx->c_enc, encrypted, &outl, raw, n);
+        if (EVP_EncryptUpdate(ctx->c_enc, encrypted, &outl, raw, n) != 1) {
+            ngx_log_error(NGX_LOG_ERR, dc->log, 0,
+                          "mtproto: EVP_EncryptUpdate (c_enc) failed");
+            ngx_http_mtproto_close(ctx);
+            return;
+        }
 
         /*
          * Wrap in TLS Application Data records into dbuf.
@@ -1800,6 +1909,17 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
         while (pos < total) {
             size_t chunk = ngx_min(total - pos,
                                    (size_t) MTPROTO_TLS_MAX_PAYLOAD);
+
+            if (ctx->dbuf_len + MTPROTO_TLS_HEADER_LEN + chunk
+                > MTPROTO_DBUF_SIZE)
+            {
+                ngx_log_error(NGX_LOG_ERR, dc->log, 0,
+                              "mtproto: dbuf overflow: need %uz, have %uz",
+                              ctx->dbuf_len + MTPROTO_TLS_HEADER_LEN + chunk,
+                              (size_t) MTPROTO_DBUF_SIZE);
+                ngx_http_mtproto_close(ctx);
+                return;
+            }
 
             ctx->dbuf[ctx->dbuf_len++] = 0x17;
             ctx->dbuf[ctx->dbuf_len++] = 0x03;
@@ -2007,8 +2127,6 @@ ngx_http_mtproto_close(ngx_http_mtproto_ctx_t *ctx)
     /* Free crypto contexts */
     if (ctx->c_dec) { EVP_CIPHER_CTX_free(ctx->c_dec); ctx->c_dec = NULL; }
     if (ctx->c_enc) { EVP_CIPHER_CTX_free(ctx->c_enc); ctx->c_enc = NULL; }
-    if (ctx->d_dec) { EVP_CIPHER_CTX_free(ctx->d_dec); ctx->d_dec = NULL; }
-    if (ctx->d_enc) { EVP_CIPHER_CTX_free(ctx->d_enc); ctx->d_enc = NULL; }
 
     /* Destroy pool (frees all allocated memory including ctx itself) */
     if (ctx->pool) {
@@ -2040,8 +2158,6 @@ ngx_http_mtproto_cleanup(void *data)
 
         if (ctx->c_dec) { EVP_CIPHER_CTX_free(ctx->c_dec); ctx->c_dec = NULL; }
         if (ctx->c_enc) { EVP_CIPHER_CTX_free(ctx->c_enc); ctx->c_enc = NULL; }
-        if (ctx->d_dec) { EVP_CIPHER_CTX_free(ctx->d_dec); ctx->d_dec = NULL; }
-        if (ctx->d_enc) { EVP_CIPHER_CTX_free(ctx->d_enc); ctx->d_enc = NULL; }
 
         ctx->state = MTPROTO_STATE_DONE;
     }
