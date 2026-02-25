@@ -2100,6 +2100,12 @@ ngx_http_mtproto_close(ngx_http_mtproto_ctx_t *ctx)
         ctx->dc_conn = NULL;
         dc->data = NULL;
 
+        if (dc->read->posted) {
+            ngx_delete_posted_event(dc->read);
+        }
+        if (dc->write->posted) {
+            ngx_delete_posted_event(dc->write);
+        }
         if (dc->read->timer_set) {
             ngx_del_timer(dc->read);
         }
@@ -2115,6 +2121,12 @@ ngx_http_mtproto_close(ngx_http_mtproto_ctx_t *ctx)
         ctx->client_conn = NULL;
         c->data = NULL;
 
+        if (c->read->posted) {
+            ngx_delete_posted_event(c->read);
+        }
+        if (c->write->posted) {
+            ngx_delete_posted_event(c->write);
+        }
         if (c->read->timer_set) {
             ngx_del_timer(c->read);
         }
@@ -2147,6 +2159,12 @@ ngx_http_mtproto_cleanup(void *data)
             ngx_connection_t *dc = ctx->dc_conn;
             ctx->dc_conn = NULL;
             dc->data = NULL;
+            if (dc->read->posted) {
+                ngx_delete_posted_event(dc->read);
+            }
+            if (dc->write->posted) {
+                ngx_delete_posted_event(dc->write);
+            }
             if (dc->read->timer_set) {
                 ngx_del_timer(dc->read);
             }
