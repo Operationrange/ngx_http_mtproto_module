@@ -564,7 +564,7 @@ ngx_http_mtproto_handler(ngx_connection_t *c)
         return;
     }
 
-    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+    ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                   "mtproto: new connection from %V", &c->addr_text);
 
     pool = ngx_create_pool(4096, c->log);
@@ -636,7 +636,7 @@ ngx_http_mtproto_preread(ngx_event_t *rev)
     ctx = c->data;
 
     if (rev->timedout) {
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        ngx_log_error(NGX_LOG_NOTICE, c->log, 0,
                       "mtproto: preread timeout");
         ngx_http_mtproto_close(ctx);
         return;
@@ -663,7 +663,7 @@ ngx_http_mtproto_preread(ngx_event_t *rev)
     }
 
     if (n == 0) {
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                       "mtproto: preread connection closed");
         ngx_http_mtproto_close(ctx);
         return;
@@ -684,7 +684,7 @@ ngx_http_mtproto_preread(ngx_event_t *rev)
 
     /* Check it looks like a TLS record */
     if (ctx->preread_data[0] != 0x16) {
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                       "mtproto: not a TLS record (0x%02xd), falling back",
                       ctx->preread_data[0]);
         ngx_http_mtproto_fallback(ctx);
@@ -696,7 +696,7 @@ ngx_http_mtproto_preread(ngx_event_t *rev)
     size_t total_needed = MTPROTO_TLS_HEADER_LEN + tls_record_len;
 
     if (total_needed > MTPROTO_PREREAD_BUF) {
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        ngx_log_error(NGX_LOG_NOTICE, c->log, 0,
                       "mtproto: TLS record too large (%uz), falling back",
                       tls_record_len);
         ngx_http_mtproto_fallback(ctx);
@@ -750,7 +750,7 @@ ngx_http_mtproto_preread(ngx_event_t *rev)
             ngx_http_mtproto_close(ctx);
         }
     } else {
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                       "mtproto: HMAC mismatch — falling back to nginx");
         ngx_http_mtproto_fallback(ctx);
     }
@@ -1054,7 +1054,7 @@ ngx_http_mtproto_client_read_obfs_header(ngx_event_t *rev)
     ctx = c->data;
 
     if (rev->timedout) {
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        ngx_log_error(NGX_LOG_NOTICE, c->log, 0,
                       "mtproto: obfs header read timeout");
         ngx_http_mtproto_close(ctx);
         return;
@@ -1072,7 +1072,7 @@ ngx_http_mtproto_client_read_obfs_header(ngx_event_t *rev)
     }
 
     if (n == 0) {
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                       "mtproto: obfs header: client closed connection (EOF)");
         ngx_http_mtproto_close(ctx);
         return;
@@ -1639,7 +1639,7 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
     }
 
     if (rev->timedout) {
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        ngx_log_error(NGX_LOG_NOTICE, c->log, 0,
                       "mtproto: client read timeout");
         ngx_http_mtproto_close(ctx);
         return;
@@ -1682,7 +1682,7 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
         }
 
         if (n <= 0) {
-            ngx_log_error(NGX_LOG_INFO, c->log, 0,
+            ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                           "mtproto: client disconnected");
             ngx_http_mtproto_close(ctx);
             return;
@@ -1836,7 +1836,7 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
     }
 
     if (rev->timedout) {
-        ngx_log_error(NGX_LOG_INFO, dc->log, 0,
+        ngx_log_error(NGX_LOG_NOTICE, dc->log, 0,
                       "mtproto: DC read timeout");
         ngx_http_mtproto_close(ctx);
         return;
@@ -1879,7 +1879,7 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
         }
 
         if (n <= 0) {
-            ngx_log_error(NGX_LOG_INFO, dc->log, 0,
+            ngx_log_error(NGX_LOG_DEBUG, dc->log, 0,
                           "mtproto: DC disconnected");
             ngx_http_mtproto_close(ctx);
             return;
@@ -1978,7 +1978,7 @@ ngx_http_mtproto_client_write_handler(ngx_event_t *wev)
     }
 
     if (wev->timedout) {
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        ngx_log_error(NGX_LOG_NOTICE, c->log, 0,
                       "mtproto: client write timeout");
         ngx_http_mtproto_close(ctx);
         return;
@@ -2036,7 +2036,7 @@ ngx_http_mtproto_dc_write_handler(ngx_event_t *wev)
     }
 
     if (wev->timedout) {
-        ngx_log_error(NGX_LOG_INFO, dc->log, 0,
+        ngx_log_error(NGX_LOG_NOTICE, dc->log, 0,
                       "mtproto: DC write timeout");
         ngx_http_mtproto_close(ctx);
         return;
