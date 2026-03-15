@@ -113,6 +113,12 @@ struct ngx_http_mtproto_ctx_s {
     size_t                        tls_payload_remain;
     ngx_flag_t                    tls_in_payload;
 
+    /* Leftover raw TLS data from the obfs header phase that arrived
+     * in the same TCP segment.  Processed before the first socket read
+     * in relay mode. */
+    u_char                       *leftover;
+    size_t                        leftover_len;
+
     /* AES-CTR crypto contexts */
     EVP_CIPHER_CTX               *c_dec;          /* decrypt from client */
     EVP_CIPHER_CTX               *c_enc;          /* encrypt to client */
@@ -1053,6 +1059,19 @@ ngx_http_mtproto_client_read_obfs_header(ngx_event_t *rev)
     c = rev->data;
     ctx = c->data;
 
+    if (ctx == NULL || ctx->state == MTPROTO_STATE_DONE) {
+        return;
+    }
+
+    /* Guard against being called again after connect_dc (handler not yet
+     * replaced — DC connection still pending).  Only process data while
+     * we are in the OBFS_HEADER state. */
+    if (ctx->state != MTPROTO_STATE_OBFS_HEADER
+        && ctx->state != MTPROTO_STATE_HELLO_SENT)
+    {
+        return;
+    }
+
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_NOTICE, c->log, 0,
                       "mtproto: obfs header read timeout");
@@ -1207,25 +1226,27 @@ ngx_http_mtproto_client_read_obfs_header(ngx_event_t *rev)
         ctx->cbuf_pos = 0;
     }
 
-    /* Also check for more TLS records after this one */
+    /* Save any remaining raw TLS data that came after the obfs2 record.
+     * This data will be processed by client_read_handler when relay starts. */
     size_t consumed = total_needed;
     size_t remaining = ctx->preread_len - consumed;
-    if (remaining > 0 && ctx->cbuf == NULL) {
-        /* Store remaining for later */
-        ctx->cbuf = ngx_pnalloc(ctx->pool, MTPROTO_RELAY_BUF);
-        if (ctx->cbuf == NULL) {
+    if (remaining > 0) {
+        ctx->leftover = ngx_pnalloc(ctx->pool, remaining);
+        if (ctx->leftover == NULL) {
             ngx_http_mtproto_close(ctx);
             return;
         }
-        ctx->cbuf_len = 0;
-        ctx->cbuf_pos = 0;
+        ngx_memcpy(ctx->leftover, ctx->preread_data + consumed, remaining);
+        ctx->leftover_len = remaining;
     }
 
     ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                   "mtproto: obfs2 parsed, DC=%d, connecting...", ctx->dc_id);
 
-    /* Connect to DC */
+    /* Connect to DC — switch client read handler so the obfs_header handler
+     * is not called again if the client sends data before DC connects. */
     ctx->state = MTPROTO_STATE_DC_CONNECTING;
+    c->read->handler = ngx_http_mtproto_client_read_handler;
     ngx_http_mtproto_connect_dc(ctx);
 }
 
@@ -1348,9 +1369,15 @@ ngx_http_mtproto_parse_obfs_header(ngx_http_mtproto_ctx_t *ctx,
         dc_id = (int16_t)(-(int32_t)dc_id);
     }
 
-    if (dc_id < 1 || dc_id > 10) {
+    if (dc_id < 1) {
         ngx_log_error(NGX_LOG_ERR, ctx->client_conn->log, 0,
-                      "mtproto: invalid DC id: %d", dc_id);
+                      "mtproto: invalid DC id: %d (raw decrypted: "
+                      "%02xd %02xd %02xd %02xd %02xd %02xd %02xd %02xd, "
+                      "proto_tag=0x%08xd)",
+                      dc_id,
+                      decrypted[0], decrypted[1], decrypted[2], decrypted[3],
+                      decrypted[4], decrypted[5], decrypted[6], decrypted[7],
+                      proto_tag);
         rc = NGX_ERROR;
         goto cleanup;
     }
@@ -1390,10 +1417,19 @@ ngx_http_mtproto_connect_dc(ngx_http_mtproto_ctx_t *ctx)
 
     dc = ngx_http_mtproto_find_dc(ctx->conf, ctx->dc_id);
     if (dc == NULL) {
-        ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                      "mtproto: DC %d not configured", ctx->dc_id);
-        ngx_http_mtproto_close(ctx);
-        return;
+        /* DC not configured (e.g. CDN DC) — fall back to default DC.
+         * The Telegram protocol layer will redirect the client if needed. */
+        dc = ngx_http_mtproto_find_dc(ctx->conf, ctx->conf->default_dc);
+        if (dc == NULL) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "mtproto: DC %d not configured, default DC %d "
+                          "also missing", ctx->dc_id, ctx->conf->default_dc);
+            ngx_http_mtproto_close(ctx);
+            return;
+        }
+        ngx_log_error(NGX_LOG_NOTICE, c->log, 0,
+                      "mtproto: DC %d not configured, routing to default "
+                      "DC %d", ctx->dc_id, ctx->conf->default_dc);
     }
 
     ngx_memzero(&pc, sizeof(ngx_peer_connection_t));
@@ -1675,21 +1711,33 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
     ngx_add_timer(rev, ctx->conf->timeout);
 
     for (;;) {
-        n = c->recv(c, raw, sizeof(raw));
+        u_char *data_ptr;
+        size_t  data_len;
 
-        if (n == NGX_AGAIN) {
-            break;
+        /* On the first iteration, drain leftover data from the obfs header
+         * phase (additional TLS records that arrived in the same segment). */
+        if (ctx->leftover_len > 0) {
+            data_ptr = ctx->leftover;
+            data_len = ctx->leftover_len;
+            ctx->leftover = NULL;
+            ctx->leftover_len = 0;
+        } else {
+            n = c->recv(c, raw, sizeof(raw));
+
+            if (n == NGX_AGAIN) {
+                break;
+            }
+
+            if (n <= 0) {
+                ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
+                              "mtproto: client disconnected");
+                ngx_http_mtproto_close(ctx);
+                return;
+            }
+
+            data_ptr = raw;
+            data_len = n;
         }
-
-        if (n <= 0) {
-            ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
-                          "mtproto: client disconnected");
-            ngx_http_mtproto_close(ctx);
-            return;
-        }
-
-        ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
-                      "mtproto: client sent %z bytes", n);
 
         /*
          * Process TLS record framing from client:
@@ -1702,10 +1750,10 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
         ctx->cbuf_pos = 0;
         ctx->cbuf_len = 0;
 
-        while (pos < (size_t) n) {
+        while (pos < data_len) {
             /* If we're in the middle of reading a TLS payload */
             if (ctx->tls_in_payload) {
-                size_t chunk = ngx_min((size_t) n - pos,
+                size_t chunk = ngx_min(data_len - pos,
                                        ctx->tls_payload_remain);
 
                 if (ctx->tls_hdr[0] == 0x14) {
@@ -1721,7 +1769,7 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
 
                 /* Decrypt client data into cbuf */
                 if (EVP_EncryptUpdate(ctx->c_dec, decrypted, &outl,
-                                      raw + pos, chunk) != 1)
+                                      data_ptr + pos, chunk) != 1)
                 {
                     ngx_log_error(NGX_LOG_ERR, c->log, 0,
                                   "mtproto: EVP_EncryptUpdate (c_dec) failed");
@@ -1751,7 +1799,7 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
 
             /* Accumulate TLS header bytes */
             if (ctx->tls_hdr_len < MTPROTO_TLS_HEADER_LEN) {
-                ctx->tls_hdr[ctx->tls_hdr_len++] = raw[pos++];
+                ctx->tls_hdr[ctx->tls_hdr_len++] = data_ptr[pos++];
 
                 if (ctx->tls_hdr_len == MTPROTO_TLS_HEADER_LEN) {
                     /* Accept AppData (0x17) and CCS (0x14); skip others */
@@ -2118,6 +2166,8 @@ ngx_http_mtproto_close(ngx_http_mtproto_ctx_t *ctx)
     /* Close client connection */
     if (ctx->client_conn) {
         ngx_connection_t *c = ctx->client_conn;
+        ngx_pool_t *cpool = c->pool;  /* nginx-allocated pool from accept */
+
         ctx->client_conn = NULL;
         c->data = NULL;
 
@@ -2134,6 +2184,13 @@ ngx_http_mtproto_close(ngx_http_mtproto_ctx_t *ctx)
             ngx_del_timer(c->write);
         }
         ngx_close_connection(c);
+
+        /* Destroy the nginx-allocated pool for this connection.
+         * ngx_close_connection does NOT free c->pool, causing a leak
+         * when we bypass ngx_http_close_connection. */
+        if (cpool) {
+            ngx_destroy_pool(cpool);
+        }
     }
 
     /* Free crypto contexts */
