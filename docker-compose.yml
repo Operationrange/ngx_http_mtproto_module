@@ -6,5 +6,6 @@ services:
     restart: unless-stopped
     volumes:
       - /etc/letsencrypt:/etc/letsencrypt:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./mtproto_dc.conf:/etc/nginx/mtproto_dc.conf:ro
     stop_signal: SIGQUIT

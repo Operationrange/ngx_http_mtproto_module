@@ -51,6 +51,9 @@ COPY --from=builder /etc/nginx /etc/nginx
 
 RUN mkdir -p /var/log/nginx /var/www/html
 
+# nginx.conf and mtproto_dc.conf are provided at runtime via compose bind-mounts
+# (both are gitignored, host-managed) so the real config + secret stay out of
+# the image. Copy the .example into the image only as a non-secret default.
 COPY nginx.conf.example /etc/nginx/nginx.conf
 
 EXPOSE 443 80
