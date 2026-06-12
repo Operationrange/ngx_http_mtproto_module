@@ -15,12 +15,14 @@
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>
 
 /* ── Forward declarations ─────────────────────────────────────────────── */
 
 typedef struct ngx_http_mtproto_srv_conf_s  ngx_http_mtproto_srv_conf_t;
 typedef struct ngx_http_mtproto_dc_s        ngx_http_mtproto_dc_t;
 typedef struct ngx_http_mtproto_ctx_s       ngx_http_mtproto_ctx_t;
+typedef struct ngx_http_mtproto_dc_pool_s   ngx_http_mtproto_dc_pool_t;
 
 static void *ngx_http_mtproto_create_srv_conf(ngx_conf_t *cf);
 static char *ngx_http_mtproto_merge_srv_conf(ngx_conf_t *cf, void *parent,
@@ -51,18 +53,46 @@ static void ngx_http_mtproto_cleanup(void *data);
 static ngx_int_t ngx_http_mtproto_flush_buf(ngx_connection_t *c, u_char *buf,
     size_t *pos, size_t *len);
 
+/* DC connection pool */
+static void ngx_http_mtproto_pool_init(ngx_http_mtproto_srv_conf_t *conf,
+    ngx_cycle_t *cycle);
+static ngx_connection_t *ngx_http_mtproto_pool_get(
+    ngx_http_mtproto_srv_conf_t *conf, ngx_int_t dc_id);
+static void ngx_http_mtproto_pool_fill_one(ngx_http_mtproto_dc_pool_t *pool);
+static void ngx_http_mtproto_pool_add(ngx_http_mtproto_dc_pool_t *pool,
+    ngx_connection_t *c);
+static void ngx_http_mtproto_pool_remove(ngx_http_mtproto_dc_pool_t *pool,
+    ngx_connection_t *c);
+static void ngx_http_mtproto_pool_connect_handler(ngx_event_t *ev);
+static void ngx_http_mtproto_pool_idle_handler(ngx_event_t *rev);
+static void ngx_http_mtproto_pool_schedule_refill(
+    ngx_http_mtproto_dc_pool_t *pool);
+static void ngx_http_mtproto_pool_refill_handler(ngx_event_t *ev);
+static ngx_int_t ngx_http_mtproto_pool_conn_alive(ngx_connection_t *c);
+
 /* ── Constants ────────────────────────────────────────────────────────── */
 
 #define MTPROTO_PREREAD_BUF     16384
-#define MTPROTO_RELAY_BUF       32768
+#define MTPROTO_RECV_BUF        65536    /* 64KB read buffer per recv() call */
+/* Accumulation buffer for one recv()'s worth of decrypted payload.  The relay
+ * loop resets and flushes cbuf on every recv iteration, so it never holds more
+ * than a single recv: <= MTPROTO_RECV_BUF minus stripped TLS headers. */
+#define MTPROTO_RELAY_BUF       MTPROTO_RECV_BUF
 #define MTPROTO_TLS_HEADER_LEN  5
 #define MTPROTO_TLS_MAX_PAYLOAD 16384
 #define MTPROTO_OBFS2_HEADER    64
 #define MTPROTO_MAX_CCS_RECORDS 16
 
-/* dbuf must hold MTPROTO_RELAY_BUF of encrypted data + TLS framing overhead:
- * ceil(32768/16384) * 5 = 10 bytes.  Round up generously. */
-#define MTPROTO_DBUF_SIZE       (MTPROTO_RELAY_BUF + 256)
+/* dbuf must hold MTPROTO_RECV_BUF of encrypted data + TLS framing overhead:
+ * ceil(65536/16384) * 5 = 20 bytes.  Round up generously. */
+#define MTPROTO_DBUF_SIZE       (MTPROTO_RECV_BUF + 256)
+
+/* DC connection pool */
+#define MTPROTO_POOL_MAX             32
+#define MTPROTO_POOL_DEFAULT         10
+#define MTPROTO_POOL_CONNECT_TIMEOUT 10000   /* ms: reap half-open pre-connects */
+#define MTPROTO_POOL_BACKOFF_BASE    1000    /* ms: initial refill retry delay */
+#define MTPROTO_POOL_BACKOFF_MAX     30000   /* ms: cap on refill backoff */
 
 /* connection states */
 #define MTPROTO_STATE_PREREAD        0
@@ -79,14 +109,40 @@ struct ngx_http_mtproto_dc_s {
     struct sockaddr_in   addr;
 };
 
+/* Pre-connect pool: one per DC, per worker process.  Stored in srv_conf so
+ * each server block has its own pools; after fork() each worker populates its
+ * own copy (copy-on-write), so no locking is needed. */
+struct ngx_http_mtproto_dc_pool_s {
+    ngx_int_t            dc_id;
+    struct sockaddr_in   addr;
+    ngx_connection_t    *conns[MTPROTO_POOL_MAX];
+    ngx_int_t            count;       /* established idle connections */
+    ngx_int_t            pending;     /* connects currently in flight */
+    ngx_int_t            target;      /* desired total (count + pending) */
+    ngx_msec_t           backoff;     /* current refill retry delay */
+    ngx_event_t          refill;      /* deferred-refill timer */
+    ngx_log_t           *log;
+};
+
+/* Per-worker shared recv scratch buffer.  The relay read handlers run to
+ * completion single-threaded and fully drain this into cbuf/dbuf before
+ * returning (reads resume via posted events, never nested), so one buffer per
+ * worker is safe and saves MTPROTO_RECV_BUF per connection. */
+static u_char  *mtproto_worker_raw = NULL;
+
 struct ngx_http_mtproto_srv_conf_s {
     ngx_flag_t                    enable;
     u_char                        secret[16];
     ngx_flag_t                    secret_set;
     ngx_msec_t                    timeout;
     ngx_int_t                     default_dc;
+    ngx_int_t                     pool_size;
     ngx_array_t                  *dcs;
     ngx_connection_handler_pt     orig_handler;
+
+    /* per-worker DC connection pools (one per configured DC) */
+    ngx_http_mtproto_dc_pool_t   *pools;
+    ngx_int_t                     npools;
 };
 
 struct ngx_http_mtproto_ctx_s {
@@ -175,6 +231,13 @@ static ngx_command_t ngx_http_mtproto_commands[] = {
       offsetof(ngx_http_mtproto_srv_conf_t, default_dc),
       NULL },
 
+    { ngx_string("mtproto_proxy_pool_size"),
+      NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_mtproto_srv_conf_t, pool_size),
+      NULL },
+
       ngx_null_command
 };
 
@@ -224,6 +287,7 @@ ngx_http_mtproto_create_srv_conf(ngx_conf_t *cf)
     conf->enable = NGX_CONF_UNSET;
     conf->timeout = NGX_CONF_UNSET_MSEC;
     conf->default_dc = NGX_CONF_UNSET;
+    conf->pool_size = NGX_CONF_UNSET;
     conf->secret_set = 0;
     conf->orig_handler = NULL;
 
@@ -237,8 +301,20 @@ ngx_http_mtproto_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_mtproto_srv_conf_t *conf = child;
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
-    ngx_conf_merge_msec_value(conf->timeout, prev->timeout, 30000);
+    /* Idle MTProto clients ping at ~60s intervals; a 30s timeout would drop
+     * healthy-but-quiet sessions, so default to 90s.  Any relayed byte resets
+     * the timer. */
+    ngx_conf_merge_msec_value(conf->timeout, prev->timeout, 90000);
     ngx_conf_merge_value(conf->default_dc, prev->default_dc, 2);
+    ngx_conf_merge_value(conf->pool_size, prev->pool_size,
+                         MTPROTO_POOL_DEFAULT);
+
+    if (conf->pool_size > MTPROTO_POOL_MAX) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                           "mtproto_proxy_pool_size %i exceeds maximum %d, "
+                           "clamping", conf->pool_size, MTPROTO_POOL_MAX);
+        conf->pool_size = MTPROTO_POOL_MAX;
+    }
 
     if (!conf->secret_set && prev->secret_set) {
         ngx_memcpy(conf->secret, prev->secret, 16);
@@ -489,6 +565,18 @@ ngx_http_mtproto_init_process(ngx_cycle_t *cycle)
                     ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
                                   "mtproto: hooked listener on %V",
                                   &ls[i].addr_text);
+
+                    /* Allocate the per-worker recv scratch buffer once */
+                    if (mtproto_worker_raw == NULL) {
+                        mtproto_worker_raw = ngx_palloc(cycle->pool,
+                                                        MTPROTO_RECV_BUF);
+                        if (mtproto_worker_raw == NULL) {
+                            return NGX_ERROR;
+                        }
+                    }
+
+                    /* Initialize DC connection pool */
+                    ngx_http_mtproto_pool_init(mscf, cycle);
                 }
                 break;
             }
@@ -1405,6 +1493,360 @@ cleanup:
     return rc;
 }
 
+/* ── DC connection pool ───────────────────────────────────────────────── */
+
+static void
+ngx_http_mtproto_pool_init(ngx_http_mtproto_srv_conf_t *conf, ngx_cycle_t *cycle)
+{
+    ngx_http_mtproto_dc_t       *dcs;
+    ngx_http_mtproto_dc_pool_t  *pool;
+    ngx_int_t                    target;
+    ngx_uint_t                   i, j;
+
+    if (conf->dcs == NULL || conf->pool_size <= 0) {
+        return;
+    }
+
+    /* One pool per configured DC, stored in srv_conf so each server block is
+     * independent.  After fork() each worker writes its own (copy-on-write)
+     * copy, so no locking is needed. */
+    conf->npools = conf->dcs->nelts;
+    conf->pools = ngx_pcalloc(cycle->pool,
+                          conf->npools * sizeof(ngx_http_mtproto_dc_pool_t));
+    if (conf->pools == NULL) {
+        conf->npools = 0;
+        return;
+    }
+
+    dcs = conf->dcs->elts;
+
+    target = conf->pool_size;
+    if (target > MTPROTO_POOL_MAX) {
+        target = MTPROTO_POOL_MAX;
+    }
+
+    for (i = 0; i < (ngx_uint_t) conf->npools; i++) {
+        pool = &conf->pools[i];
+
+        pool->dc_id = dcs[i].dc_id;
+        pool->addr = dcs[i].addr;
+        pool->target = target;
+        pool->backoff = MTPROTO_POOL_BACKOFF_BASE;
+        pool->log = cycle->log;
+
+        pool->refill.handler = ngx_http_mtproto_pool_refill_handler;
+        pool->refill.data = pool;
+        pool->refill.log = cycle->log;
+        pool->refill.cancelable = 1;   /* must not block worker shutdown */
+
+        /* Warm the pool now so the first clients get a pooled connection. */
+        for (j = 0; j < (ngx_uint_t) target; j++) {
+            ngx_http_mtproto_pool_fill_one(pool);
+        }
+
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                      "mtproto: initialized pool for DC %d (target=%d)",
+                      pool->dc_id, pool->target);
+    }
+}
+
+
+static void
+ngx_http_mtproto_pool_schedule_refill(ngx_http_mtproto_dc_pool_t *pool)
+{
+    /* Don't churn reconnects while the worker is shutting down. */
+    if (ngx_exiting || ngx_terminate) {
+        return;
+    }
+
+    if (pool->count + pool->pending >= pool->target) {
+        return;
+    }
+
+    if (!pool->refill.timer_set) {
+        ngx_add_timer(&pool->refill, pool->backoff);
+    }
+}
+
+
+static void
+ngx_http_mtproto_pool_refill_handler(ngx_event_t *ev)
+{
+    ngx_http_mtproto_dc_pool_t  *pool = ev->data;
+    ngx_int_t                    want;
+
+    if (ngx_exiting || ngx_terminate) {
+        return;
+    }
+
+    /* Top up to target.  fill_one() that fails synchronously re-arms this
+     * timer with a grown backoff; pending connects report later. */
+    want = pool->target - pool->count - pool->pending;
+
+    while (want-- > 0) {
+        ngx_http_mtproto_pool_fill_one(pool);
+    }
+}
+
+static void
+ngx_http_mtproto_pool_fill_one(ngx_http_mtproto_dc_pool_t *pool)
+{
+    ngx_peer_connection_t   pc;
+    ngx_connection_t       *c;
+    ngx_int_t               rc;
+    u_char                  text[NGX_SOCKADDR_STRLEN];
+    ngx_str_t               addr_str;
+
+    /* Count in-flight connects too, so we don't over-provision. */
+    if (pool->count + pool->pending >= pool->target) {
+        return;
+    }
+
+    ngx_memzero(&pc, sizeof(ngx_peer_connection_t));
+
+    pc.sockaddr = (struct sockaddr *) &pool->addr;
+    pc.socklen = sizeof(struct sockaddr_in);
+
+    addr_str.data = text;
+    addr_str.len = ngx_sock_ntop(pc.sockaddr, pc.socklen, text,
+                                 NGX_SOCKADDR_STRLEN, 1);
+
+    pc.name = &addr_str;
+    pc.get = ngx_event_get_peer;
+    pc.log = pool->log;
+    pc.log_error = NGX_ERROR_ERR;
+    pc.rcvbuf = MTPROTO_RECV_BUF;
+
+    rc = ngx_event_connect_peer(&pc);
+
+    if (rc == NGX_ERROR || rc == NGX_DECLINED) {
+        ngx_log_error(NGX_LOG_DEBUG, pool->log, 0,
+                      "mtproto: pool DC %d: pre-connect failed", pool->dc_id);
+        pool->backoff = ngx_min(pool->backoff * 2, MTPROTO_POOL_BACKOFF_MAX);
+        ngx_http_mtproto_pool_schedule_refill(pool);
+        return;
+    }
+
+    c = pc.connection;
+    c->data = pool;
+
+    /* While connecting, route BOTH events to the connect handler: on an
+     * asynchronous failure epoll dispatches the read event first (EPOLLERR
+     * raises EPOLLIN|EPOLLOUT), and it must not reach the idle handler, whose
+     * old behaviour was an immediate close+reconnect tight loop. */
+    c->read->handler = ngx_http_mtproto_pool_connect_handler;
+    c->write->handler = ngx_http_mtproto_pool_connect_handler;
+
+    if (rc == NGX_OK) {
+        /* Connected immediately (e.g. loopback). */
+        ngx_http_mtproto_pool_add(pool, c);
+        return;
+    }
+
+    /* rc == NGX_AGAIN: in flight.  Arm a connect timeout so a blackholed DC
+     * doesn't pin the socket for the kernel SYN-retry duration (~127s). */
+    pool->pending++;
+    ngx_add_timer(c->write, MTPROTO_POOL_CONNECT_TIMEOUT);
+}
+
+static void
+ngx_http_mtproto_pool_connect_handler(ngx_event_t *ev)
+{
+    ngx_connection_t            *c;
+    ngx_http_mtproto_dc_pool_t  *pool;
+    int                          err;
+    socklen_t                    errlen;
+
+    c = ev->data;
+    pool = c->data;
+
+    pool->pending--;
+
+    if (ev->timedout) {
+        ngx_log_error(NGX_LOG_DEBUG, pool->log, 0,
+                      "mtproto: pool DC %d: connect timeout", pool->dc_id);
+        ngx_close_connection(c);
+        pool->backoff = ngx_min(pool->backoff * 2, MTPROTO_POOL_BACKOFF_MAX);
+        ngx_http_mtproto_pool_schedule_refill(pool);
+        return;
+    }
+
+    err = 0;
+    errlen = sizeof(int);
+
+    if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &errlen) == -1
+        || err != 0)
+    {
+        ngx_log_error(NGX_LOG_DEBUG, pool->log, 0,
+                      "mtproto: pool DC %d: connect error %d",
+                      pool->dc_id, err);
+        ngx_close_connection(c);
+        pool->backoff = ngx_min(pool->backoff * 2, MTPROTO_POOL_BACKOFF_MAX);
+        ngx_http_mtproto_pool_schedule_refill(pool);
+        return;
+    }
+
+    if (c->write->timer_set) {
+        ngx_del_timer(c->write);
+    }
+
+    /* Disable Nagle on the pooled connection. */
+    {
+        int nodelay = 1;
+        setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(int));
+    }
+
+    ngx_http_mtproto_pool_add(pool, c);
+}
+
+static void
+ngx_http_mtproto_pool_idle_handler(ngx_event_t *rev)
+{
+    ngx_connection_t            *c;
+    ngx_http_mtproto_dc_pool_t  *pool;
+    u_char                       probe;
+    ssize_t                      n;
+
+    c = rev->data;
+    pool = c->data;
+
+    /* nginx is reclaiming this connection (graceful shutdown / drain). */
+    if (c->close) {
+        ngx_http_mtproto_pool_remove(pool, c);
+        ngx_close_connection(c);
+        return;
+    }
+
+    /* Probe without consuming so a spurious wakeup doesn't trigger a
+     * needless close+reconnect: only real EOF / data / error reaps. */
+    n = recv(c->fd, &probe, 1, MSG_PEEK);
+
+    if (n < 0 && ngx_socket_errno == NGX_EAGAIN) {
+        rev->ready = 0;
+        if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+            ngx_http_mtproto_pool_remove(pool, c);
+            ngx_close_connection(c);
+            ngx_http_mtproto_pool_schedule_refill(pool);
+        }
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_DEBUG, pool->log, 0,
+                  "mtproto: pool DC %d: idle connection closed", pool->dc_id);
+
+    ngx_http_mtproto_pool_remove(pool, c);
+    ngx_close_connection(c);
+    ngx_http_mtproto_pool_schedule_refill(pool);
+}
+
+static void
+ngx_http_mtproto_pool_add(ngx_http_mtproto_dc_pool_t *pool,
+    ngx_connection_t *c)
+{
+    if (pool->count >= pool->target || pool->count >= MTPROTO_POOL_MAX) {
+        ngx_close_connection(c);
+        return;
+    }
+
+    c->data = pool;
+    c->idle = 1;        /* reclaimable by nginx on graceful shutdown / drain */
+    c->read->handler = ngx_http_mtproto_pool_idle_handler;
+    c->write->handler = ngx_http_mtproto_pool_idle_handler;
+
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        ngx_close_connection(c);
+        ngx_http_mtproto_pool_schedule_refill(pool);
+        return;
+    }
+
+    pool->conns[pool->count++] = c;
+
+    /* A successful connect means the DC is reachable — reset backoff. */
+    pool->backoff = MTPROTO_POOL_BACKOFF_BASE;
+
+    ngx_log_error(NGX_LOG_DEBUG, pool->log, 0,
+                  "mtproto: pool DC %d: added (count=%d/%d)",
+                  pool->dc_id, pool->count, pool->target);
+}
+
+static void
+ngx_http_mtproto_pool_remove(ngx_http_mtproto_dc_pool_t *pool,
+    ngx_connection_t *c)
+{
+    ngx_int_t  i;
+
+    for (i = 0; i < pool->count; i++) {
+        if (pool->conns[i] == c) {
+            pool->conns[i] = pool->conns[pool->count - 1];
+            pool->count--;
+            return;
+        }
+    }
+}
+
+static ngx_int_t
+ngx_http_mtproto_pool_conn_alive(ngx_connection_t *c)
+{
+    u_char   probe;
+    ssize_t  n;
+
+    /* Cheap checks first: epoll may already have flagged EOF/error. */
+    if (c->close || c->error
+        || c->read->eof || c->read->error || c->read->pending_eof)
+    {
+        return 0;
+    }
+
+    /* Authoritative probe: a healthy idle DC connection has no readable data
+     * and no pending EOF, so MSG_PEEK returns EAGAIN. */
+    n = recv(c->fd, &probe, 1, MSG_PEEK);
+
+    return (n < 0 && ngx_socket_errno == NGX_EAGAIN) ? 1 : 0;
+}
+
+static ngx_connection_t *
+ngx_http_mtproto_pool_get(ngx_http_mtproto_srv_conf_t *conf, ngx_int_t dc_id)
+{
+    ngx_http_mtproto_dc_pool_t  *pool;
+    ngx_connection_t            *c;
+    ngx_int_t                    i;
+
+    if (conf->pools == NULL) {
+        return NULL;
+    }
+
+    for (i = 0; i < conf->npools; i++) {
+        pool = &conf->pools[i];
+
+        if (pool->dc_id != dc_id) {
+            continue;
+        }
+
+        while (pool->count > 0) {
+            c = pool->conns[--pool->count];
+
+            if (!ngx_http_mtproto_pool_conn_alive(c)) {
+                /* Stale (DC idle-closed it) — discard and try the next. */
+                ngx_close_connection(c);
+                continue;
+            }
+
+            ngx_log_error(NGX_LOG_DEBUG, pool->log, 0,
+                          "mtproto: pool DC %d: acquired (remaining=%d)",
+                          dc_id, pool->count);
+
+            ngx_http_mtproto_pool_schedule_refill(pool);
+            return c;
+        }
+
+        /* Empty or all-stale — refill and fall back to a fresh connect. */
+        ngx_http_mtproto_pool_schedule_refill(pool);
+        return NULL;
+    }
+
+    return NULL;
+}
+
 /* ── DC connection ────────────────────────────────────────────────────── */
 
 static void
@@ -1414,6 +1856,7 @@ ngx_http_mtproto_connect_dc(ngx_http_mtproto_ctx_t *ctx)
     ngx_peer_connection_t   pc;
     ngx_int_t               rc;
     ngx_connection_t        *c = ctx->client_conn;
+    ngx_connection_t        *pooled;
 
     dc = ngx_http_mtproto_find_dc(ctx->conf, ctx->dc_id);
     if (dc == NULL) {
@@ -1432,6 +1875,35 @@ ngx_http_mtproto_connect_dc(ngx_http_mtproto_ctx_t *ctx)
                       "DC %d", ctx->dc_id, ctx->conf->default_dc);
     }
 
+    /* Try a pre-connected pooled connection first (already verified live by
+     * pool_get). */
+    pooled = ngx_http_mtproto_pool_get(ctx->conf, dc->dc_id);
+
+    if (pooled != NULL) {
+        ctx->dc_conn = pooled;
+        pooled->data = ctx;
+        pooled->pool = ctx->pool;
+        pooled->idle = 0;                  /* no longer a reclaimable idle conn */
+
+        /* Re-point the pooled connection's logs (set to the worker log at
+         * pre-connect time) at this client's connection log. */
+        pooled->log = c->log;
+        pooled->read->log = c->log;
+        pooled->write->log = c->log;
+
+        pooled->read->handler = ngx_http_mtproto_dc_read_handler;
+        pooled->write->handler = ngx_http_mtproto_dc_connect_handler;
+
+        ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
+                      "mtproto: using pooled connection to DC %d",
+                      dc->dc_id);
+
+        /* Connection is established — send protocol init and enter relay. */
+        ngx_http_mtproto_dc_connect_handler(pooled->write);
+        return;
+    }
+
+    /* No pooled connection — connect normally */
     ngx_memzero(&pc, sizeof(ngx_peer_connection_t));
 
     pc.sockaddr = (struct sockaddr *) &dc->addr;
@@ -1448,7 +1920,7 @@ ngx_http_mtproto_connect_dc(ngx_http_mtproto_ctx_t *ctx)
     pc.get = ngx_event_get_peer;
     pc.log = c->log;
     pc.log_error = NGX_ERROR_ERR;
-    pc.rcvbuf = MTPROTO_RELAY_BUF;
+    pc.rcvbuf = MTPROTO_RECV_BUF;
 
     rc = ngx_event_connect_peer(&pc);
 
@@ -1519,6 +1991,21 @@ ngx_http_mtproto_dc_connect_handler(ngx_event_t *wev)
                   "mtproto: connected to DC %d", ctx->dc_id);
 
     /*
+     * Disable Nagle's algorithm on both DC and client sockets.
+     * MTProto ping/pong packets are small — Nagle + delayed ACK interaction
+     * adds 40-200ms latency per direction.
+     */
+    {
+        int nodelay = 1;
+        setsockopt(dc->fd, IPPROTO_TCP, TCP_NODELAY,
+                   &nodelay, sizeof(int));
+        if (ctx->client_conn) {
+            setsockopt(ctx->client_conn->fd, IPPROTO_TCP, TCP_NODELAY,
+                       &nodelay, sizeof(int));
+        }
+    }
+
+    /*
      * DC connection uses plain transport (no obfuscated2):
      *   - Send the client's protocol tag to DC
      *   - Relay plaintext data (no crypto on DC side)
@@ -1540,7 +2027,8 @@ ngx_http_mtproto_dc_connect_handler(ngx_event_t *wev)
                       ctx->dc_id, ctx->proto_tag);
     }
 
-    /* Allocate relay buffers if not yet done */
+    /* Allocate relay buffers if not yet done (recv scratch is shared per
+     * worker, see mtproto_worker_raw). */
     if (ctx->cbuf == NULL) {
         ctx->cbuf = ngx_pnalloc(ctx->pool, MTPROTO_RELAY_BUF);
         if (ctx->cbuf == NULL) {
@@ -1621,6 +2109,14 @@ ngx_http_mtproto_dc_connect_handler(ngx_event_t *wev)
         return;
     }
 
+    /* Trailing TLS records that arrived in the same segment as the obfs header
+     * are buffered in ctx->leftover.  That data was already consumed from the
+     * socket during preread, so no new read event will fire to drain it — post
+     * the client read handler so the first request isn't stalled to timeout. */
+    if (ctx->leftover_len > 0) {
+        ngx_post_event(ctx->client_conn->read, &ngx_posted_events);
+    }
+
     ngx_log_error(NGX_LOG_DEBUG, ctx->client_conn->log, 0,
                   "mtproto: relay mode active, DC=%d", ctx->dc_id);
 }
@@ -1663,8 +2159,6 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
     ngx_http_mtproto_ctx_t    *ctx;
     ssize_t                    n;
     ngx_int_t                  rc;
-    u_char                     raw[MTPROTO_RELAY_BUF];
-    u_char                     decrypted[MTPROTO_RELAY_BUF];
     int                        outl;
 
     c = rev->data;
@@ -1698,6 +2192,7 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
             /* Still blocked — keep write event armed, deactivate read */
             if (ngx_handle_write_event(ctx->dc_conn->write, 0) != NGX_OK) {
                 ngx_http_mtproto_close(ctx);
+                return;
             }
             ngx_handle_read_event(rev, 0);
             return;
@@ -1722,7 +2217,7 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
             ctx->leftover = NULL;
             ctx->leftover_len = 0;
         } else {
-            n = c->recv(c, raw, sizeof(raw));
+            n = c->recv(c, mtproto_worker_raw, MTPROTO_RECV_BUF);
 
             if (n == NGX_AGAIN) {
                 break;
@@ -1735,14 +2230,14 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
                 return;
             }
 
-            data_ptr = raw;
+            data_ptr = mtproto_worker_raw;
             data_len = n;
         }
 
         /*
          * Process TLS record framing from client:
          * Each record: [type, 0x03, 0x03, len_hi, len_lo, payload...]
-         * We strip headers and decrypt payloads into cbuf.
+         * We strip headers and decrypt payloads directly into cbuf.
          * CCS records (0x14) are silently skipped.
          */
         size_t pos = 0;
@@ -1767,8 +2262,16 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
                     continue;
                 }
 
-                /* Decrypt client data into cbuf */
-                if (EVP_EncryptUpdate(ctx->c_dec, decrypted, &outl,
+                /* Decrypt client data directly into cbuf (zero-copy) */
+                if (ctx->cbuf_len + chunk > MTPROTO_RELAY_BUF) {
+                    ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                                  "mtproto: cbuf overflow");
+                    ngx_http_mtproto_close(ctx);
+                    return;
+                }
+
+                if (EVP_EncryptUpdate(ctx->c_dec,
+                                      ctx->cbuf + ctx->cbuf_len, &outl,
                                       data_ptr + pos, chunk) != 1)
                 {
                     ngx_log_error(NGX_LOG_ERR, c->log, 0,
@@ -1776,16 +2279,7 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
                     ngx_http_mtproto_close(ctx);
                     return;
                 }
-                if (outl > 0) {
-                    if (ctx->cbuf_len + (size_t) outl > MTPROTO_RELAY_BUF) {
-                        ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                                      "mtproto: cbuf overflow");
-                        ngx_http_mtproto_close(ctx);
-                        return;
-                    }
-                    ngx_memcpy(ctx->cbuf + ctx->cbuf_len, decrypted, outl);
-                    ctx->cbuf_len += outl;
-                }
+                ctx->cbuf_len += outl;
 
                 pos += chunk;
                 ctx->tls_payload_remain -= chunk;
@@ -1798,6 +2292,8 @@ ngx_http_mtproto_client_read_handler(ngx_event_t *rev)
             }
 
             /* Accumulate TLS header bytes */
+            /* TODO: use memcpy when remaining bytes >= MTPROTO_TLS_HEADER_LEN
+             * for better throughput at high packet rates */
             if (ctx->tls_hdr_len < MTPROTO_TLS_HEADER_LEN) {
                 ctx->tls_hdr[ctx->tls_hdr_len++] = data_ptr[pos++];
 
@@ -1872,8 +2368,6 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
     ngx_http_mtproto_ctx_t    *ctx;
     ssize_t                    n;
     ngx_int_t                  rc;
-    u_char                     raw[MTPROTO_RELAY_BUF];
-    u_char                     encrypted[MTPROTO_RELAY_BUF];
     int                        outl;
 
     dc = rev->data;
@@ -1907,6 +2401,7 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
             /* Still blocked — keep write event armed, deactivate read */
             if (ngx_handle_write_event(ctx->client_conn->write, 0) != NGX_OK) {
                 ngx_http_mtproto_close(ctx);
+                return;
             }
             ngx_handle_read_event(rev, 0);
             return;
@@ -1920,7 +2415,7 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
     ngx_add_timer(rev, ctx->conf->timeout);
 
     for (;;) {
-        n = dc->recv(dc, raw, sizeof(raw));
+        n = dc->recv(dc, mtproto_worker_raw, MTPROTO_RECV_BUF);
 
         if (n == NGX_AGAIN) {
             break;
@@ -1936,26 +2431,18 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
         ngx_log_error(NGX_LOG_DEBUG, dc->log, 0,
                       "mtproto: DC sent %z bytes", n);
 
-        /* DC data is plaintext — encrypt for client (obfs2) */
-        if (EVP_EncryptUpdate(ctx->c_enc, encrypted, &outl, raw, n) != 1) {
-            ngx_log_error(NGX_LOG_ERR, dc->log, 0,
-                          "mtproto: EVP_EncryptUpdate (c_enc) failed");
-            ngx_http_mtproto_close(ctx);
-            return;
-        }
-
         /*
-         * Wrap in TLS Application Data records into dbuf.
-         * Split into chunks of max 16384 bytes.
+         * DC data is plaintext — encrypt and wrap in TLS Application Data
+         * records directly into dbuf (zero-copy).  Split into chunks of
+         * max 16384 bytes for TLS framing.
          */
-        size_t pos = 0;
-        size_t total = outl;
+        size_t raw_pos = 0;
 
         ctx->dbuf_pos = 0;
         ctx->dbuf_len = 0;
 
-        while (pos < total) {
-            size_t chunk = ngx_min(total - pos,
+        while (raw_pos < (size_t) n) {
+            size_t chunk = ngx_min((size_t) n - raw_pos,
                                    (size_t) MTPROTO_TLS_MAX_PAYLOAD);
 
             if (ctx->dbuf_len + MTPROTO_TLS_HEADER_LEN + chunk
@@ -1969,15 +2456,26 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
                 return;
             }
 
+            /* TLS record header */
             ctx->dbuf[ctx->dbuf_len++] = 0x17;
             ctx->dbuf[ctx->dbuf_len++] = 0x03;
             ctx->dbuf[ctx->dbuf_len++] = 0x03;
             ctx->dbuf[ctx->dbuf_len++] = (chunk >> 8) & 0xff;
             ctx->dbuf[ctx->dbuf_len++] = chunk & 0xff;
-            ngx_memcpy(ctx->dbuf + ctx->dbuf_len, encrypted + pos, chunk);
-            ctx->dbuf_len += chunk;
 
-            pos += chunk;
+            /* Encrypt directly into dbuf after TLS header (zero-copy) */
+            if (EVP_EncryptUpdate(ctx->c_enc,
+                                  ctx->dbuf + ctx->dbuf_len, &outl,
+                                  mtproto_worker_raw + raw_pos, chunk) != 1)
+            {
+                ngx_log_error(NGX_LOG_ERR, dc->log, 0,
+                              "mtproto: EVP_EncryptUpdate (c_enc) failed");
+                ngx_http_mtproto_close(ctx);
+                return;
+            }
+            ctx->dbuf_len += outl;
+
+            raw_pos += chunk;
         }
 
         /* Flush framed data to client */
@@ -1992,7 +2490,9 @@ ngx_http_mtproto_dc_read_handler(ngx_event_t *rev)
             }
 
             if (rc == NGX_AGAIN) {
-                /* Backpressure: stop reading from DC, arm client write */
+                /* Backpressure: stop reading from DC, arm client write
+                 * TODO: consider allowing reads to continue into remaining
+                 * dbuf space for better pipelining on high-latency links */
                 if (ngx_handle_write_event(ctx->client_conn->write, 0)
                     != NGX_OK)
                 {
